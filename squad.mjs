@@ -25,11 +25,12 @@
 
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 
 const ROOT = process.cwd();
-const GROK_EXE = process.env.GROK_EXE || join(homedir(), '.grok', 'bin', 'grok.exe');
+const GROK_EXE = process.env.GROK_EXE ||
+  (process.platform === 'win32' ? join(homedir(), '.grok', 'bin', 'grok.exe') : 'grok');
 
 function findBash() {
   const cands = [
@@ -71,6 +72,19 @@ const AGENTS = {
 
 const sh = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 
+// Availability checks — fail early and readable instead of a confusing shell error later.
+function cmdPath(bin) {
+  const r = spawnSync(BASH, ['-c', `command -v ${sh(bin)}`], { encoding: 'utf8' });
+  return r.status === 0 ? (r.stdout || '').trim() : null;
+}
+function agentPath(name) {
+  if (name === 'grok') {
+    if (/[\\/]/.test(GROK_EXE)) return existsSync(GROK_EXE) ? GROK_EXE : null;
+    return cmdPath(GROK_EXE);
+  }
+  return cmdPath(name);
+}
+
 // Grok as a CRITIC with pre-injected context — NOT a repo reader. Its agent build tends to
 // blow up on read_file with long prompts (tool_output_error). Fix: self-contained prompt via
 // --prompt-file + tools trimmed to the minimum (--no-memory/--no-plan/--no-subagents/
@@ -83,10 +97,12 @@ function runGrokDirect(pFile, oFile, eFile, { cwd, code }, attempt = 0) {
     const args = ['--disable-web-search', '--no-memory', '--no-plan', '--no-subagents', '--max-turns', '1',
       ...(code ? ['--always-approve'] : []), '--prompt-file', pFile];
     const child = spawn(GROK_EXE, args, { cwd: cwd || ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
+    const killer = setTimeout(() => child.kill('SIGKILL'), TIMEOUT_MS);
     let out = '', err = '';
     child.stdout.on('data', (d) => { out += d; });
     child.stderr.on('data', (d) => { err += d.toString(); });
     child.on('close', async (codeNum) => {
+      clearTimeout(killer);
       const clean = out.split('\n').filter(GROK_NOISE).join('\n').trim();
       const toolErr = /tool_error|tool_output_error|read_file|Agent building failed/.test(err);
       if ((!clean || toolErr) && attempt === 0) {
@@ -100,11 +116,13 @@ function runGrokDirect(pFile, oFile, eFile, { cwd, code }, attempt = 0) {
       writeFileSync(eFile, err, 'utf8');
       resolve({ ok: codeNum === 0 && !!clean, code: codeNum, retried: attempt > 0 });
     });
-    child.on('error', (e) => { writeFileSync(oFile, '', 'utf8'); writeFileSync(eFile, String(e), 'utf8'); resolve({ ok: false, err: String(e) }); });
+    child.on('error', (e) => { clearTimeout(killer); writeFileSync(oFile, '', 'utf8'); writeFileSync(eFile, String(e), 'utf8'); resolve({ ok: false, err: String(e) }); });
   });
 }
 
-function runBash(cmd, cwd, timeoutMs = 600000) {
+let TIMEOUT_MS = Number(process.env.SQUAD_TIMEOUT_MS) || 600000;
+
+function runBash(cmd, cwd, timeoutMs = TIMEOUT_MS) {
   return new Promise((resolve) => {
     const child = spawn(BASH, ['-c', cmd], { cwd: cwd || ROOT, stdio: ['ignore', 'ignore', 'ignore'] });
     const timer = setTimeout(() => { child.kill('SIGKILL'); resolve({ ok: false, err: 'timeout' }); }, timeoutMs);
@@ -149,7 +167,7 @@ async function runOne(task, i, dir, { code }) {
   const grokNote = task.agent === 'grok'
     ? `\n\nIMPORTANT (Grok): do NOT read files or use tools — answer only from the context in this prompt. If code context is missing, say what is missing instead of trying to read.`
     : '';
-  const ctx = task.agent === 'grok' ? (task.grokCtx || '') : '';
+  const ctx = task.agent === 'grok' ? (task.grokCtx || task.ctx || '') : (task.ctx || '');
   writeFileSync(pFile, `${head}${grokNote}\n\nTASK: ${task.prompt}${ctx}`, 'utf8');
 
   const t0 = Date.now();
@@ -174,7 +192,13 @@ async function runOne(task, i, dir, { code }) {
     const d = spawnSync(BASH, ['-c', `git -C ${sh(cwd)} status --porcelain`], { cwd: ROOT, encoding: 'utf8' });
     touched = (d.stdout || '').split('\n').map((l) => l.slice(3).trim()).filter(Boolean);
   }
-  const stray = task.files ? touched.filter((f) => !task.files.includes(f)) : [];
+  const normRel = (f) => {
+    let p = f.replace(/\\/g, '/').replace(/^\.\//, '');
+    if (process.platform === 'win32' || process.platform === 'darwin') p = p.toLowerCase();
+    return p;
+  };
+  const allowed = (task.files || []).map(normRel);
+  const stray = task.files ? touched.filter((f) => !allowed.includes(normRel(f))) : [];
 
   console.log(`  ${ok ? '✓' : '✗'} ${a.label} (${secs}s${wt ? ', wt-' + task.agent + '-' + i : ''})` +
     (ok ? '' : ` — ${res.err || res.code || 'empty output'}${errSnippet ? ' | ' + errSnippet : ''}`) +
@@ -188,7 +212,8 @@ function parseFlags(argv) {
   const flags = new Set(argv.filter((a) => a.startsWith('--')));
   const only = flags.has('--only') ? argv[argv.indexOf('--only') + 1]?.split(',').map((s) => s.trim()) : null;
   const files = flags.has('--files') ? argv[argv.indexOf('--files') + 1]?.split(',').map((s) => s.trim()) : null;
-  return { flags, only, files };
+  const timeout = flags.has('--timeout') ? Number(argv[argv.indexOf('--timeout') + 1]) : null;
+  return { flags, only, files, timeout };
 }
 
 // Builds the injected context block for Grok (which cannot read the repo).
@@ -221,6 +246,14 @@ function buildInjectedContext(files, stdinText) {
   return `\n\n## CODE/DATA CONTEXT (injected by the squad — this is the REAL state of the repo)\n\n${parts.join('\n\n')}`;
 }
 
+// Normalizes a path claim so `src/a.js`, `./src/a.js` and `src\a.js` compare equal
+// (case-insensitive on Windows/macOS, where the filesystem usually is too).
+function normClaim(f) {
+  let p = resolve(ROOT, f).replace(/\\/g, '/');
+  if (process.platform === 'win32' || process.platform === 'darwin') p = p.toLowerCase();
+  return p;
+}
+
 // Pre-flight validation: valid agents + file overlap between tasks.
 function validateTasks(tasks) {
   const errors = [];
@@ -228,7 +261,8 @@ function validateTasks(tasks) {
   for (let i = 0; i < tasks.length; i++) {
     for (let j = i + 1; j < tasks.length; j++) {
       const a = tasks[i].files || [], b = tasks[j].files || [];
-      const overlap = a.filter((f) => b.includes(f));
+      const bNorm = b.map(normClaim);
+      const overlap = a.filter((f) => bNorm.includes(normClaim(f)));
       if (overlap.length) errors.push(`tasks #${i + 1} and #${j + 1} both claim: ${overlap.join(', ')} — not independent`);
     }
   }
@@ -237,29 +271,55 @@ function validateTasks(tasks) {
 
 (async function main() {
   const [mode, ...rest] = process.argv.slice(2);
-  const { flags, only, files } = parseFlags(rest);
+  const { flags, only, files, timeout } = parseFlags(rest);
+  if (timeout) TIMEOUT_MS = timeout * 1000;
   const id = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
   const dir = join(ROOT, '.squad', id);
+
+  if (mode === 'doctor') {
+    console.log(`\n🩺 agent-squad doctor\n`);
+    console.log(`  Node: ${process.version}`);
+    console.log(`  Bash: ${existsSync(BASH) || cmdPath('bash') ? BASH : 'NOT FOUND — install Git Bash (Windows) or bash'}`);
+    const git = spawnSync(BASH, ['-c', 'git --version'], { encoding: 'utf8' });
+    console.log(`  Git: ${git.status === 0 ? git.stdout.trim() + ' (worktrees ok)' : 'NOT FOUND — required for code mode'}`);
+    const runnable = [];
+    for (const name of Object.keys(AGENTS)) {
+      const p = agentPath(name);
+      if (p) runnable.push(name);
+      console.log(`  ${AGENTS[name].label} (${name}): ${p ? `found ${p}` : 'not found'}`);
+    }
+    console.log(`\n  Runnable agents: ${runnable.join(', ') || 'none — install at least one CLI'}\n`);
+    return;
+  }
 
   if (mode === 'ideas') {
     // Excludes flags AND their values from the question.
     const flagValueIdx = new Set();
-    rest.forEach((a, i) => { if (a === '--only' || a === '--files') flagValueIdx.add(i + 1); });
+    rest.forEach((a, i) => { if (a === '--only' || a === '--files' || a === '--timeout') flagValueIdx.add(i + 1); });
     const question = rest.filter((a, i) => !a.startsWith('--') && !flagValueIdx.has(i)).join(' ').trim();
-    if (!question) { console.error('usage: node squad.mjs ideas "question" [--only codex,grok] [--files a.js,b.js]'); process.exit(1); }
-    const agents = (only || Object.keys(AGENTS)).filter((n) => AGENTS[n]);
-    if (!agents.length) { console.error('usage: no valid agent in --only'); process.exit(1); }
+    if (!question) { console.error('usage: node squad.mjs ideas "question" [--only codex,grok] [--files a.js,b.js] [--timeout secs]'); process.exit(1); }
 
-    // Injected context for Grok: --files and/or stdin (`-` in the list).
+    let agents;
+    if (only) {
+      agents = only.filter((n) => AGENTS[n]);
+      if (!agents.length) { console.error('usage: no valid agent in --only'); process.exit(1); }
+      const missing = agents.filter((n) => !agentPath(n));
+      if (missing.length) { console.error(`❌ agent CLI not found: ${missing.join(', ')} — run \`node squad.mjs doctor\``); process.exit(1); }
+    } else {
+      agents = Object.keys(AGENTS).filter((n) => agentPath(n));
+      if (!agents.length) { console.error('❌ no agent CLIs found on this machine — run `node squad.mjs doctor`'); process.exit(1); }
+    }
+
+    // Injected context (--files and/or stdin via `-`) goes to ALL agents in ideas mode.
     let stdinText = '';
     if (files?.includes('-')) {
       try { stdinText = readFileSync(0, 'utf8'); } catch { stdinText = ''; }
     }
-    const grokCtx = buildInjectedContext(files, stdinText);
+    const ctx = buildInjectedContext(files, stdinText);
 
     mkdirSync(dir, { recursive: true });
-    console.log(`\n💡 Squad IDEAS ${id} — ${agents.join(', ')}${grokCtx ? `  (ctx injected into Grok: ${grokCtx.length} chars)` : ''}\n❓ ${question}\n`);
-    const results = await Promise.all(agents.map((agent, i) => runOne({ agent, title: 'idea', prompt: question, grokCtx }, i, dir, { code: false })));
+    console.log(`\n💡 Squad IDEAS ${id} — ${agents.join(', ')}${ctx ? `  (ctx injected: ${ctx.length} chars)` : ''}\n❓ ${question}\n`);
+    const results = await Promise.all(agents.map((agent, i) => runOne({ agent, title: 'idea', prompt: question, ctx }, i, dir, { code: false })));
     const md = `# 💡 Squad ideas ${id}\n\n**Question:** ${question}\n\n` + results.map((r) => `## ${r.label}\n\n${r.text}\n`).join('\n');
     writeFileSync(join(dir, 'summary.md'), md, 'utf8');
     console.log(`\n${results.map((r) => `\x1b[1m${r.label}\x1b[0m\n${r.text}\n`).join('\n')}`);
@@ -282,11 +342,24 @@ function validateTasks(tasks) {
     }));
     if (!tasks.length) { console.error('usage: spec has no tasks.'); process.exit(1); }
 
+    const missing = [...new Set(tasks.map((t) => t.agent))].filter((n) => AGENTS[n] && !agentPath(n));
+    if (missing.length && !flags.has('--dry-run')) {
+      console.error(`❌ agent CLI not found: ${missing.join(', ')} — run \`node squad.mjs doctor\``);
+      process.exit(1);
+    }
+
     const verrs = validateTasks(tasks);
     console.log(`\n🛠️  Squad CODE ${id} — ${tasks.length} tasks\n`);
     tasks.forEach((t) => console.log(`  • [${t.agent}] ${t.title || t.prompt.slice(0, 50)}${t.worktree ? '  (worktree)' : ''}${t.files ? '  files: ' + t.files.join(',') : ''}`));
     if (verrs.length) { console.error(`\n❌ Validation failed:\n  - ${verrs.join('\n  - ')}`); process.exit(1); }
     if (flags.has('--dry-run')) { console.log('\n(dry-run: nothing executed)'); return; }
+
+    if (tasks.some((t) => t.worktree)) {
+      const dirty = spawnSync(BASH, ['-c', 'git status --porcelain'], { cwd: ROOT, encoding: 'utf8' });
+      if ((dirty.stdout || '').trim()) {
+        console.log('  ⚠️  Working tree has uncommitted changes — worktrees branch from HEAD and will NOT see them.');
+      }
+    }
 
     mkdirSync(dir, { recursive: true });
     const results = await Promise.all(tasks.map((t, i) => runOne(t, i, dir, { code: true })));
@@ -304,6 +377,9 @@ function validateTasks(tasks) {
     return;
   }
 
-  console.error('usage: node squad.mjs <ideas|code> ...');
+  console.error('usage: node squad.mjs <ideas|code|doctor> ...');
+  console.error('  ideas "question" [--only claude,codex,grok] [--files a.js,b.js|-] [--timeout secs]');
+  console.error('  code tasks.json [--worktree] [--dry-run] [--timeout secs]');
+  console.error('  doctor    # check which agent CLIs are available');
   process.exit(1);
 })();

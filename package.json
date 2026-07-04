@@ -1,0 +1,13 @@
+{
+  "name": "agent-squad",
+  "version": "0.2.0",
+  "description": "Run multiple coding-agent CLIs in parallel — divergent brainstorming + isolated coding with git worktrees. Zero deps, one file.",
+  "type": "module",
+  "bin": { "agent-squad": "./squad.mjs" },
+  "scripts": { "test": "node --test" },
+  "engines": { "node": ">=18" },
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/reisspedro/agent-squad.git" },
+  "keywords": ["ai", "agents", "claude-code", "codex", "grok", "parallel", "git-worktree", "cli", "orchestration"],
+  "files": ["squad.mjs", "SKILL.md", "README.md", "LICENSE", "tasks.example.json"]
+}

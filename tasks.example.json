@@ -1,0 +1,17 @@
+{
+  "tasks": [
+    {
+      "agent": "codex",
+      "title": "docs pass",
+      "prompt": "Improve the README quickstart section only. Keep the tone.",
+      "files": ["README.md"]
+    },
+    {
+      "agent": "claude",
+      "title": "parser tests",
+      "prompt": "Write test/parser.test.mjs covering the error cases of src/parser.js.",
+      "worktree": true,
+      "files": ["test/parser.test.mjs"]
+    }
+  ]
+}

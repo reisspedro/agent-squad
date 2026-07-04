@@ -8,10 +8,17 @@ Not a chat. A *fan-out*: every agent receives the task at the same time, works i
 Works today with **Claude Code** (`claude -p`), **Codex** (`codex exec`) and **Grok CLI**.
 Single file, zero dependencies, Node 18+.
 
+```bash
+npx agent-squad doctor      # which agent CLIs do I have?
+npx agent-squad ideas "what's the biggest coupling risk in this codebase?"
+npx agent-squad code tasks.json --worktree
 ```
-npm i    # nothing to install — it's one file
-node squad.mjs ideas "what's the biggest coupling risk in this codebase?"
-node squad.mjs code tasks.json --worktree
+
+Or just grab the file — it's one script, zero deps:
+
+```bash
+curl -O https://raw.githubusercontent.com/reisspedro/agent-squad/master/squad.mjs
+node squad.mjs doctor
 ```
 
 ## Why
@@ -23,6 +30,16 @@ node squad.mjs code tasks.json --worktree
 - **Trustable in automation.** Any failed/empty task → `exit 1`. Out-of-scope edits are
   flagged in the summary.
 
+## `doctor` — know before you burn tokens
+
+```bash
+node squad.mjs doctor
+```
+
+Reports Node, Bash, Git and each agent CLI (found / not found), plus the list of runnable
+agents. `ideas` runs whatever is available by default; `--only` fails fast if a requested
+CLI is missing.
+
 ## Mode 1 — `ideas` (divergent brainstorming, read-only)
 
 ```bash
@@ -32,12 +49,15 @@ node squad.mjs ideas "review this data" --files src/router.js,metrics.json
 cat report.txt | node squad.mjs ideas "what stands out?" --files -
 ```
 
-The same question goes to all agents simultaneously. Answers land in
-`.squad/<id>/summary.md` plus one `.out.md` per agent.
+The same question goes to all **available** agents simultaneously (use `--only` to pin).
+Answers land in `.squad/<id>/summary.md` plus one `.out.md` per agent.
 
-`--files a.js,b.js` injects file **content** into Grok's prompt (its CLI is unstable when
-reading files itself on long prompts, so the squad reads for it — with per-file and total
-caps). `-` injects stdin. Claude and Codex explore the repo on their own.
+`--files a.js,b.js` injects file **content** into every agent's prompt (with per-file and
+total caps), so all three argue over the same evidence. `-` injects stdin. Without
+`--files`, Claude and Codex explore the repo on their own; Grok answers from the prompt
+alone (its CLI is unstable reading files on long prompts).
+
+`--timeout 300` caps each agent at 300s (default 600, or env `SQUAD_TIMEOUT_MS`).
 
 ## Mode 2 — `code` (simultaneous coding, isolated)
 
@@ -46,7 +66,7 @@ node squad.mjs code tasks.json --worktree
 node squad.mjs code tasks.json --dry-run   # show the plan, execute nothing
 ```
 
-`tasks.json`:
+`tasks.json` (see [tasks.example.json](tasks.example.json)):
 
 ```json
 {
@@ -60,9 +80,10 @@ node squad.mjs code tasks.json --dry-run   # show the plan, execute nothing
 
 - `agent`: `claude` | `codex` | `grok`
 - `files` (optional, recommended): what the task MAY touch. Two tasks claiming the same file
-  → abort (they're not independent). In worktree mode, edits outside the allowlist are
-  flagged in `summary.md`.
-- `worktree`: per-task override of the `--worktree` flag.
+  → abort (they're not independent; paths are normalized, so `src/a.js` and `./src/a.js`
+  collide). In worktree mode, edits outside the allowlist are flagged in `summary.md`.
+- `worktree`: per-task override of the `--worktree` flag. Worktrees branch from `HEAD` —
+  uncommitted changes are not visible to the agents (the CLI warns you).
 
 **Golden rule: one unit = one owner.** If two tasks need the same file, they're one task.
 
@@ -94,9 +115,12 @@ Add `.squad/` to your `.gitignore`.
 |---|---|---|
 | `claude` | [Claude Code](https://claude.com/claude-code) (`claude`) | prompt via stdin |
 | `codex` | Codex CLI (`codex`) | answer captured via `-o` |
-| `grok` | Grok CLI | binary path override: env `GROK_EXE` |
+| `grok` | Grok CLI (`grok`; Windows default `~/.grok/bin/grok.exe`) | override: env `GROK_EXE` |
+
+You don't need all three — `ideas` uses whatever `doctor` finds.
 
 - Windows: uses Git Bash automatically (override with env `SQUAD_BASH`). Linux/macOS: `/bin/bash`.
+- Per-agent timeout: `--timeout <secs>` or env `SQUAD_TIMEOUT_MS` (default 10 min).
 - `code` mode runs agents with their permission-bypass flags — **only use it in repos you
   trust, and always review the diffs.**
 
