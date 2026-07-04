@@ -1,0 +1,3 @@
+# squad runs (prompts, answers, worktrees)
+.squad/
+node_modules
