@@ -212,7 +212,14 @@ function parseFlags(argv) {
   const flags = new Set(argv.filter((a) => a.startsWith('--')));
   const only = flags.has('--only') ? argv[argv.indexOf('--only') + 1]?.split(',').map((s) => s.trim()) : null;
   const files = flags.has('--files') ? argv[argv.indexOf('--files') + 1]?.split(',').map((s) => s.trim()) : null;
-  const timeout = flags.has('--timeout') ? Number(argv[argv.indexOf('--timeout') + 1]) : null;
+  let timeout = null;
+  if (flags.has('--timeout')) {
+    timeout = Number(argv[argv.indexOf('--timeout') + 1]);
+    if (!Number.isFinite(timeout) || timeout <= 0) {
+      console.error('usage: --timeout expects a positive number of seconds');
+      process.exit(1);
+    }
+  }
   return { flags, only, files, timeout };
 }
 
@@ -273,14 +280,17 @@ function validateTasks(tasks) {
   const [mode, ...rest] = process.argv.slice(2);
   const { flags, only, files, timeout } = parseFlags(rest);
   if (timeout) TIMEOUT_MS = timeout * 1000;
-  const id = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+  const id = new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 17);
   const dir = join(ROOT, '.squad', id);
 
   if (mode === 'doctor') {
     console.log(`\n🩺 agent-squad doctor\n`);
     console.log(`  Node: ${process.version}`);
-    console.log(`  Bash: ${existsSync(BASH) || cmdPath('bash') ? BASH : 'NOT FOUND — install Git Bash (Windows) or bash'}`);
-    const git = spawnSync(BASH, ['-c', 'git --version'], { encoding: 'utf8' });
+    const bashProbe = spawnSync(BASH, ['-c', 'echo ok'], { encoding: 'utf8' });
+    console.log(`  Bash: ${bashProbe.stdout?.trim() === 'ok' ? BASH
+      : existsSync(BASH) ? `${BASH} found but NOT RUNNABLE — check permissions/antivirus`
+        : 'NOT FOUND — install Git Bash (Windows) or bash'}`);
+    const git = spawnSync('git', ['--version'], { encoding: 'utf8' });
     console.log(`  Git: ${git.status === 0 ? git.stdout.trim() + ' (worktrees ok)' : 'NOT FOUND — required for code mode'}`);
     const runnable = [];
     for (const name of Object.keys(AGENTS)) {
@@ -329,7 +339,9 @@ function validateTasks(tasks) {
   }
 
   if (mode === 'code') {
-    const specPath = rest.find((a) => !a.startsWith('--'));
+    const codeFlagValueIdx = new Set();
+    rest.forEach((a, i) => { if (a === '--timeout') codeFlagValueIdx.add(i + 1); });
+    const specPath = rest.find((a, i) => !a.startsWith('--') && !codeFlagValueIdx.has(i));
     if (!specPath || !existsSync(specPath)) { console.error('usage: node squad.mjs code tasks.json [--worktree] [--dry-run]'); process.exit(1); }
     let spec;
     try { spec = JSON.parse(readFileSync(specPath, 'utf8')); }
