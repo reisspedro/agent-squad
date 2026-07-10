@@ -30,6 +30,22 @@ node squad.mjs doctor
 - **Trustable in automation.** Any failed/empty task → `exit 1`. Out-of-scope edits are
   flagged in the summary.
 
+## Roles & benchmarking your squad
+
+A squad works best with **lanes**: one leader/integrator, a precision implementer, a
+creative critic. Don't assign lanes by reputation — measure. [BENCHMARK.md](BENCHMARK.md)
+is a complete protocol (6 categories, adversarial cross-harness, blind jury with
+self-scores dropped, consensus round) we validated in production across two full runs.
+[SKILL.md](SKILL.md) packages the whole method as a drop-in skill for any agent that
+reads instructions — Claude Code, Codex, Grok, or anything with a skills directory.
+
+Review discipline that survived contact with reality:
+- **Cross-review is mandatory** for protected files (auth/schema/prompts/security) and
+  multi-file changes; optional for isolated UI and trivial tested fixes.
+- **Precision rule:** reviewers deliver at most one finding per root defect — recall
+  without precision is noise.
+- **Objective beats jury:** if it can run, run it; argue only about what can't.
+
 ## `doctor` — know before you burn tokens
 
 ```bash
@@ -118,6 +134,13 @@ Add `.squad/` to your `.gitignore`.
 | `grok` | Grok CLI (`grok`; Windows default `~/.grok/bin/grok.exe`) | override: env `GROK_EXE` |
 
 You don't need all three — `ideas` uses whatever `doctor` finds.
+
+**Adding your own agent:** any CLI with a headless mode (prompt in, text out) fits. Edit
+the `AGENTS` table at the top of `squad.mjs` — each entry is a ~5-line adapter that gets
+the prompt as a *file path* (never shell-interpolated) and writes output/stderr to files.
+Local models (Ollama wrappers), other vendor CLIs, or an HTTP script all plug in the same
+way. If your agent can't read the repo (sandboxed/remote), feed it evidence via `--files`
+instead of letting it explore blind.
 
 - Windows: uses Git Bash automatically (override with env `SQUAD_BASH`). Linux/macOS: `/bin/bash`.
 - Per-agent timeout: `--timeout <secs>` or env `SQUAD_TIMEOUT_MS` (default 10 min).
