@@ -1,6 +1,6 @@
 {
   "name": "agent-squad",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Run multiple coding-agent CLIs in parallel — divergent brainstorming, isolated coding with git worktrees, and parallel code review of real diffs. Zero deps, one file.",
   "type": "module",
   "bin": { "agent-squad": "./squad.mjs" },

@@ -8,10 +8,26 @@
 //   code:  simultaneous coding; with --worktree each coder gets an isolated git worktree (zero conflicts)
 //
 // Usage:
-//   node squad.mjs ideas  "your question"  [--only codex,grok] [--files a.js,b.js]
+//   node squad.mjs ideas  "your question"  [--only codex,grok] [--files a.js,b.js] [--session name]
 //   node squad.mjs code   tasks.json       [--worktree] [--dry-run]
 //   node squad.mjs review [ref] --goal "what the change should do"
 //                         [--verify "cmd1;;cmd2"] [--author claude] [--allow-truncate]
+//   node squad.mjs session <list|show name|reset name>
+//
+// --session <name> (ideas mode): OPT-IN persistent session for Codex and Grok — kills the
+//   re-explanation tax on a long discussion thread. Default stays FRESH. Claude always runs
+//   fresh on purpose (one clean control voice). Only the CLI session ids are stored, in
+//   .squad-sessions/<name>.json; hard-stop after 8 uses or 7 days (growing context is
+//   growing cost — ending a session must be a deliberate act, never a silent reset).
+//   A failed resume degrades to a fresh call with a loud warning — it never kills the run.
+//   review/code REJECT the flag: an adversarial reviewer must come in clean, and parallel
+//   code tasks must not share context. Manage with: node squad.mjs session list|show|reset.
+//
+// ANTI-ECHO (ideas mode): every answer must END with a locked-position block
+//   (CHOICE / TRADEOFF ACCEPTED / TRADEOFF REJECTED / KILL / DISSENT / CONFIDENCE).
+//   The runner extracts it into a table at the top of summary.md and warns "possible echo"
+//   when two agents' tradeoffs come out ≥70% similar (Jaccard). The warning is advisory:
+//   the adjudicator invalidates a round, never the script — independent consensus exists.
 //
 // review: parallel CODE REVIEW of a real diff — closes the loop "code → test → have the
 //   squad check the result". No ref = uncommitted changes (git diff HEAD, NEW untracked
@@ -37,9 +53,10 @@
 // inherit context from each other.
 
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync, unlinkSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
+import { randomUUID } from 'node:crypto';
 
 const ROOT = process.cwd();
 const GROK_EXE = process.env.GROK_EXE ||
@@ -73,10 +90,12 @@ const AGENTS = {
     label: 'Codex',
     // codex reads the prompt FILE (avoids $(cat) breaking on backticks/quotes); -o captures
     // the LAST agent message only — so the instruction demands the full answer inline.
-    spawn: ({ pFile, oFile, eFile, code, cwd }) => ({
-      cmd: `codex exec ${code ? '--dangerously-bypass-approvals-and-sandbox ' : ''}-o ${sh(oFile)} ` +
+    // resumeId resumes a session (`codex exec resume <id>`); jsonFile enables --json and
+    // captures the event stream (where the runner grabs the thread_id of a new session).
+    spawn: ({ pFile, oFile, eFile, code, cwd, resumeId, jsonFile }) => ({
+      cmd: `codex exec ${resumeId ? `resume ${sh(resumeId)} ` : ''}${code ? '--dangerously-bypass-approvals-and-sandbox ' : ''}${jsonFile ? '--json ' : ''}-o ${sh(oFile)} ` +
         `"Read the file ${pFile} and execute the task. ${code ? 'Do the work and say what you touched at the end.' : 'Answer the COMPLETE analysis directly in your FINAL MESSAGE — do not write it to a separate file, do not end with just a meta-summary. The last message must contain the entire answer.'}" ` +
-        `< /dev/null > /dev/null 2> ${sh(eFile)}`,
+        `< /dev/null > ${jsonFile ? sh(jsonFile) : '/dev/null'} 2> ${sh(eFile)}`,
       bash: true, cwd,
     }),
   },
@@ -105,9 +124,9 @@ function agentPath(name) {
 // agent (search_replace requires a Read tool). File context, when needed, is injected by the
 // squad — Grok doesn't read.
 const GROK_NOISE = (l) => !l.includes('MCP server') && !l.toLowerCase().includes('discord') && !l.includes('program not found');
-function runGrokDirect(pFile, oFile, eFile, { cwd, code, noDegradedRetry }, attempt = 0) {
+function runGrokDirect(pFile, oFile, eFile, { cwd, code, noDegradedRetry, sessionArgs = [], sessionLost = false }, attempt = 0) {
   return new Promise((resolve) => {
-    const args = ['--disable-web-search', '--no-memory', '--no-plan', '--no-subagents', '--max-turns', '1',
+    const args = [...sessionArgs, '--disable-web-search', '--no-memory', '--no-plan', '--no-subagents', '--max-turns', '1',
       ...(code ? ['--always-approve'] : []), '--prompt-file', pFile];
     const child = spawn(GROK_EXE, args, { cwd: cwd || ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
     const killer = setTimeout(() => child.kill('SIGKILL'), TIMEOUT_MS);
@@ -118,6 +137,13 @@ function runGrokDirect(pFile, oFile, eFile, { cwd, code, noDegradedRetry }, atte
       clearTimeout(killer);
       const clean = out.split('\n').filter(GROK_NOISE).join('\n').trim();
       const toolErr = /tool_error|tool_output_error|read_file|Agent building failed/.test(err);
+      // A failing session call (invalid resume id, rejected --session-id, exit ≠ 0 with
+      // diagnostics on stdout) must NOT kill the run: redo FRESH with a loud warning and
+      // keep the old id intact for `session reset`. Exit ≠ 0 only matters HERE — the
+      // classic degraded retry keeps its original condition (surgical scope).
+      if (attempt === 0 && sessionArgs.length && (!clean || toolErr || codeNum !== 0)) {
+        return resolve(await runGrokDirect(pFile, oFile, eFile, { cwd, code, noDegradedRetry, sessionArgs: [], sessionLost: true }, 1));
+      }
       if ((!clean || toolErr) && attempt === 0 && !noDegradedRetry) {
         // degraded (not blind) retry: shorter, self-contained prompt, once.
         // Review mode NEVER takes this path (noDegradedRetry): approving after reading
@@ -129,7 +155,7 @@ function runGrokDirect(pFile, oFile, eFile, { cwd, code, noDegradedRetry }, atte
       }
       writeFileSync(oFile, clean, 'utf8');
       writeFileSync(eFile, err, 'utf8');
-      resolve({ ok: codeNum === 0 && !!clean, code: codeNum, retried: attempt > 0 });
+      resolve({ ok: codeNum === 0 && !!clean, code: codeNum, retried: attempt > 0, sessionLost });
     });
     child.on('error', (e) => { clearTimeout(killer); writeFileSync(oFile, '', 'utf8'); writeFileSync(eFile, String(e), 'utf8'); resolve({ ok: false, err: String(e) }); });
   });
@@ -190,10 +216,18 @@ async function runOne(task, i, dir, { code }) {
   let res;
   if (a.direct) {
     // Grok: pass the prompt FILE (--prompt-file preserves structure, avoids quoting/argv limits).
-    res = await runGrokDirect(pFile, oFile, eFile, { cwd, code, noDegradedRetry: task.noDegradedRetry });
+    res = await runGrokDirect(pFile, oFile, eFile, { cwd, code, noDegradedRetry: task.noDegradedRetry, sessionArgs: task.grokSessionArgs || [] });
   } else {
-    const s = a.spawn({ pFile, oFile, eFile, code, cwd });
+    const s = a.spawn({ pFile, oFile, eFile, code, cwd, resumeId: task.codexResumeId, jsonFile: task.codexJsonFile });
     res = await runBash(s.cmd, s.cwd);
+    const got = existsSync(oFile) ? readFileSync(oFile, 'utf8').trim() : '';
+    if (task.codexResumeId && (!res.ok || !got)) {
+      // resume failed → redo FRESH with a warning; the old id stays intact for `session reset`
+      // (same policy as Grok: a lost session never kills the run).
+      const s2 = a.spawn({ pFile, oFile, eFile, code, cwd, jsonFile: task.codexJsonFile });
+      res = await runBash(s2.cmd, s2.cwd);
+      res.sessionLost = true;
+    }
   }
 
   const out = existsSync(oFile) ? readFileSync(oFile, 'utf8').trim() : '';
@@ -220,13 +254,94 @@ async function runOne(task, i, dir, { code }) {
     (stray.length ? `  ⚠️ outside allowlist: ${stray.join(', ')}` : ''));
 
   return { ...task, i, label: a.label, text: out || `*(no answer: ${res.err || res.code}; stderr: ${errSnippet})*`,
-    ok, secs, worktreePath: wt?.path, branch: wt?.branch, touched, stray };
+    ok, secs, worktreePath: wt?.path, branch: wt?.branch, touched, stray, sessionLost: !!res.sessionLost };
+}
+
+// ---------- Persistent sessions (opt-in, ideas mode only) ----------
+// A session stores ONLY the CLI session ids — transcripts live inside each CLI, never
+// duplicated here. The squad default stays FRESH: memory is a tool, not the default state.
+const SESS_DIR = join(ROOT, '.squad-sessions');
+const SESS_MAX_USES = 8;
+const SESS_MAX_AGE_DAYS = 7;
+// Name validation BEFORE any path work: without it, `session reset ../../package` would
+// resolve outside SESS_DIR and delete package.json.
+const validSessName = (n) => /^[a-z0-9][a-z0-9-]{0,40}$/i.test(String(n || ''));
+const sessFile = (name) => join(SESS_DIR, `${name}.json`);
+const gitHead = () => (spawnSync(BASH, ['-c', 'git rev-parse --short HEAD'], { cwd: ROOT, encoding: 'utf8' }).stdout || '').trim();
+
+function loadSession(name) {
+  if (!validSessName(name) || !existsSync(sessFile(name))) return null;
+  try {
+    const s = JSON.parse(readFileSync(sessFile(name), 'utf8'));
+    // Valid JSON without the minimal shape = corrupted — otherwise uses becomes NaN and
+    // the hard-stop is bypassable.
+    if (!s || typeof s.uses !== 'number' || !s.agents || typeof s.agents !== 'object' || !s.createdAt) return null;
+    return s;
+  } catch { return null; }
+}
+function saveSession(s) {
+  mkdirSync(SESS_DIR, { recursive: true });
+  writeFileSync(sessFile(s.name), JSON.stringify(s, null, 2), 'utf8');
+}
+// Opens (or creates) a ready-to-use session — or exits with a clear instruction.
+// Hard-stop on uses/age: growing context is growing cost, and ending a thread must be a
+// deliberate decision by whoever pays the bill, never a silent reset.
+function openSession(name) {
+  if (!validSessName(name)) { console.error(`usage: invalid session name "${name}" (letters/digits/hyphens)`); process.exit(1); }
+  const now = new Date();
+  const s = loadSession(name);
+  if (!s) {
+    if (existsSync(sessFile(name))) console.log(`⚠️ session "${name}" is corrupted — recreating from scratch.`);
+    return { version: 1, name, root: ROOT, createdAt: now.toISOString(), updatedAt: now.toISOString(), uses: 0, head: gitHead(), agents: {} };
+  }
+  if (s.root !== ROOT) { console.error(`usage: session "${name}" belongs to another repo (${s.root}) — use another name or: node squad.mjs session reset ${name}`); process.exit(1); }
+  const ageDays = (now - new Date(s.createdAt)) / 86400000;
+  if (s.uses >= SESS_MAX_USES || ageDays > SESS_MAX_AGE_DAYS) {
+    console.error(`usage: session "${name}" expired (${s.uses} uses, ${ageDays.toFixed(1)}d — limit ${SESS_MAX_USES} uses/${SESS_MAX_AGE_DAYS}d).`);
+    console.error(`End it deliberately: node squad.mjs session reset ${name}`);
+    process.exit(1);
+  }
+  return s;
+}
+// codex exec --json emits JSONL events; the thread_id of the first event is the resumable id.
+function captureCodexThreadId(jsonFile) {
+  if (!jsonFile || !existsSync(jsonFile)) return null;
+  const m = /"thread_id"\s*:\s*"([^"]+)"/.exec(readFileSync(jsonFile, 'utf8'));
+  return m ? m[1] : null;
+}
+
+// ---------- Anti-echo (ideas mode) ----------
+// Mandatory locked position at the END of the answer (end, not start: the divergent free
+// prose is the value of the mode).
+const ANTIECHO_RULES = `
+
+END your answer with the mandatory block (one block per sub-question if there are several):
+## ANTI-ECHO
+CHOICE: <your decision in 1 closed sentence — "it depends" doesn't count>
+TRADEOFF ACCEPTED: <the cost you accept to pay>
+TRADEOFF REJECTED: <the cost you refuse to pay>
+KILL: <what stops existing if your choice wins>
+DISSENT: <where the others are probably wrong>
+CONFIDENCE: low|medium|high`;
+
+function antiEchoOf(text) {
+  const grab = (label) => [...String(text || '').matchAll(new RegExp(`^${label}:\\s*(.+)$`, 'gim'))].map((m) => m[1].trim());
+  return { choices: grab('CHOICE'), conf: grab('CONFIDENCE'), trade: [...grab('TRADEOFF ACCEPTED'), ...grab('TRADEOFF REJECTED')].join(' ') };
+}
+const wordSet = (s) => new Set(String(s).toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').match(/[a-z0-9]{3,}/g) || []);
+function jaccard(a, b) {
+  const A = wordSet(a), B = wordSet(b);
+  if (!A.size || !B.size) return 0;
+  let inter = 0;
+  for (const w of A) if (B.has(w)) inter++;
+  return inter / (A.size + B.size - inter);
 }
 
 function parseFlags(argv) {
   const flags = new Set(argv.filter((a) => a.startsWith('--')));
   const only = flags.has('--only') ? argv[argv.indexOf('--only') + 1]?.split(',').map((s) => s.trim()) : null;
   const files = flags.has('--files') ? argv[argv.indexOf('--files') + 1]?.split(',').map((s) => s.trim()) : null;
+  const session = flags.has('--session') ? argv[argv.indexOf('--session') + 1] : null;
   let timeout = null;
   if (flags.has('--timeout')) {
     timeout = Number(argv[argv.indexOf('--timeout') + 1]);
@@ -235,7 +350,7 @@ function parseFlags(argv) {
       process.exit(1);
     }
   }
-  return { flags, only, files, timeout };
+  return { flags, only, files, session, timeout };
 }
 
 // Builds the injected context block for Grok (which cannot read the repo).
@@ -293,10 +408,54 @@ function validateTasks(tasks) {
 
 (async function main() {
   const [mode, ...rest] = process.argv.slice(2);
-  const { flags, only, files, timeout } = parseFlags(rest);
+  const { flags, only, files, session: sessionName, timeout } = parseFlags(rest);
   if (timeout) TIMEOUT_MS = timeout * 1000;
   const id = new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 17);
   const dir = join(ROOT, '.squad', id);
+
+  // Presence of the flag, not truthiness of the value: `review --session` (no value) is
+  // also rejected, and `ideas --session` without a name errors instead of silently
+  // running fresh.
+  if (flags.has('--session') && mode !== 'ideas') {
+    console.error('usage: --session only exists in ideas mode — review and code always run clean.');
+    process.exit(1);
+  }
+  if (flags.has('--session') && (!sessionName || sessionName.startsWith('--'))) {
+    console.error('usage: --session requires a name (e.g. --session renderer)');
+    process.exit(1);
+  }
+
+  // Session management: node squad.mjs session list|show <name>|reset <name>
+  if (mode === 'session') {
+    const [action, name] = rest;
+    if ((action === 'show' || action === 'reset') && name && !validSessName(name)) {
+      console.error(`usage: invalid session name "${name}" (letters/digits/hyphens)`);
+      process.exit(1);
+    }
+    if (action === 'list') {
+      const names = existsSync(SESS_DIR) ? readdirSync(SESS_DIR).filter((f) => f.endsWith('.json')).map((f) => f.slice(0, -5)) : [];
+      if (!names.length) { console.log('(no sessions)'); return; }
+      for (const n of names) {
+        const s = loadSession(n);
+        console.log(`🧵 ${n} — ${s ? `${s.uses}/${SESS_MAX_USES} uses, agents: ${Object.keys(s.agents).join(',') || 'none'}, updated ${s.updatedAt}` : '(corrupted)'}`);
+      }
+      return;
+    }
+    if (action === 'show' && name) {
+      const s = loadSession(name);
+      if (!s) { console.error(`usage: session "${name}" does not exist (or is corrupted).`); process.exit(1); }
+      console.log(JSON.stringify(s, null, 2));
+      return;
+    }
+    if (action === 'reset' && name) {
+      if (!existsSync(sessFile(name))) { console.error(`usage: session "${name}" does not exist.`); process.exit(1); }
+      unlinkSync(sessFile(name));
+      console.log(`🧵 session "${name}" ended — the next call with --session ${name} starts from scratch.`);
+      return;
+    }
+    console.error('usage: node squad.mjs session <list|show name|reset name>');
+    process.exit(1);
+  }
 
   if (mode === 'doctor') {
     console.log(`\n🩺 agent-squad doctor\n`);
@@ -320,9 +479,9 @@ function validateTasks(tasks) {
   if (mode === 'ideas') {
     // Excludes flags AND their values from the question.
     const flagValueIdx = new Set();
-    rest.forEach((a, i) => { if (a === '--only' || a === '--files' || a === '--timeout') flagValueIdx.add(i + 1); });
+    rest.forEach((a, i) => { if (a === '--only' || a === '--files' || a === '--timeout' || a === '--session') flagValueIdx.add(i + 1); });
     const question = rest.filter((a, i) => !a.startsWith('--') && !flagValueIdx.has(i)).join(' ').trim();
-    if (!question) { console.error('usage: node squad.mjs ideas "question" [--only codex,grok] [--files a.js,b.js] [--timeout secs]'); process.exit(1); }
+    if (!question) { console.error('usage: node squad.mjs ideas "question" [--only codex,grok] [--files a.js,b.js] [--session name] [--timeout secs]'); process.exit(1); }
 
     let agents;
     if (only) {
@@ -335,17 +494,86 @@ function validateTasks(tasks) {
       if (!agents.length) { console.error('❌ no agent CLIs found on this machine — run `node squad.mjs doctor`'); process.exit(1); }
     }
 
+    // Opt-in persistent session (Codex/Grok only; Claude runs fresh on purpose — one
+    // clean control voice keeps the thread honest).
+    const sess = sessionName ? openSession(sessionName) : null;
+
     // Injected context (--files and/or stdin via `-`) goes to ALL agents in ideas mode.
     let stdinText = '';
     if (files?.includes('-')) {
       try { stdinText = readFileSync(0, 'utf8'); } catch { stdinText = ''; }
     }
-    const ctx = buildInjectedContext(files, stdinText);
+    let ctx = buildInjectedContext(files, stdinText);
+    // On resume the agents already carry history — make it explicit that the fresh block
+    // WINS over whatever they remember from earlier in the session.
+    if (ctx && sess && (sess.agents.codex?.sessionId || sess.agents.grok?.sessionId)) {
+      ctx = ctx.replace('## CODE/DATA CONTEXT', '## CODE/DATA CONTEXT (CURRENT — supersedes ANY earlier version you remember from this session)');
+    }
 
     mkdirSync(dir, { recursive: true });
-    console.log(`\n💡 Squad IDEAS ${id} — ${agents.join(', ')}${ctx ? `  (ctx injected: ${ctx.length} chars)` : ''}\n❓ ${question}\n`);
-    const results = await Promise.all(agents.map((agent, i) => runOne({ agent, title: 'idea', prompt: question, ctx }, i, dir, { code: false })));
-    const md = `# 💡 Squad ideas ${id}\n\n**Question:** ${question}\n\n` + results.map((r) => `## ${r.label}\n\n${r.text}\n`).join('\n');
+    console.log(`\n💡 Squad IDEAS ${id} — ${agents.join(', ')}${ctx ? `  (ctx injected: ${ctx.length} chars)` : ''}${sess ? `  🧵 session "${sess.name}" (use ${sess.uses + 1}/${SESS_MAX_USES})` : ''}\n❓ ${question}\n`);
+    const results = await Promise.all(agents.map((agent, i) => {
+      const t = { agent, title: 'idea', prompt: question + ANTIECHO_RULES, ctx };
+      if (sess && agent === 'grok') {
+        const prev = sess.agents.grok?.sessionId;
+        if (prev) t.grokSessionArgs = ['--resume', prev];
+        else { t.grokNewId = randomUUID(); t.grokSessionArgs = ['--session-id', t.grokNewId]; }
+      }
+      if (sess && agent === 'codex') {
+        t.codexJsonFile = join(dir, `codex-${i}.events.jsonl`);
+        const prev = sess.agents.codex?.sessionId;
+        if (prev) t.codexResumeId = prev;
+      }
+      return runOne(t, i, dir, { code: false });
+    }));
+
+    // Update the session ONCE, after everything (Promise.all already centralized — no races).
+    let sessNote = '';
+    if (sess) {
+      const notes = [];
+      for (const r of results) {
+        if (r.agent === 'grok') {
+          if (!r.ok) notes.push('grok: failed — session not updated');
+          else if (r.sessionLost) notes.push('grok: ⚠️ resume FAILED → answered fresh (session reset recreates)');
+          else if (r.grokNewId) { sess.agents.grok = { sessionId: r.grokNewId }; notes.push('grok: new session'); }
+          else notes.push('grok: resumed');
+        }
+        if (r.agent === 'codex') {
+          if (!r.ok) notes.push('codex: failed — session not updated');
+          else if (r.sessionLost) notes.push('codex: ⚠️ resume FAILED → answered fresh (session reset recreates)');
+          else if (!r.codexResumeId) {
+            const tid = captureCodexThreadId(r.codexJsonFile);
+            if (tid) { sess.agents.codex = { sessionId: tid }; notes.push('codex: new session'); }
+            else notes.push('codex: ⚠️ thread_id not captured — next call will be fresh');
+          } else notes.push('codex: resumed');
+        }
+      }
+      sess.uses += 1;
+      const head = gitHead();
+      if (sess.head && sess.head !== head) notes.push(`HEAD moved ${sess.head} → ${head} (remembered context may be stale)`);
+      sess.head = head;
+      sess.updatedAt = new Date().toISOString();
+      saveSession(sess);
+      sessNote = `\n**Session:** \`${sess.name}\` (use ${sess.uses}/${SESS_MAX_USES}) — ${notes.join(' · ')}\n`;
+      console.log(`\n🧵 session "${sess.name}" (use ${sess.uses}/${SESS_MAX_USES}): ${notes.join(' · ')}`);
+    }
+
+    // Anti-echo table + similarity warning (advisory: the adjudicator decides, never the script).
+    const echo = results.map((r) => ({ label: r.label, ...antiEchoOf(r.text) }));
+    const echoTable = echo.map((e) => `| ${e.label} | ${e.choices.slice(0, 4).map((c) => c.slice(0, 90)).join(' · ') || '—'} | ${e.conf.join('/') || '—'} | ${e.choices.length ? '✓' : 'NO BLOCK'} |`).join('\n');
+    const echoWarns = [];
+    for (let i = 0; i < echo.length; i++) {
+      for (let j = i + 1; j < echo.length; j++) {
+        const sim = jaccard(echo[i].trade, echo[j].trade);
+        if (sim >= 0.7) echoWarns.push(`⚠️ possible echo: ${echo[i].label} ↔ ${echo[j].label} (tradeoffs ${Math.round(sim * 100)}% similar) — check for real dissent before synthesizing`);
+      }
+    }
+    if (echoWarns.length) console.log(`\n${echoWarns.join('\n')}`);
+
+    const md = `# 💡 Squad ideas ${id}\n\n**Question:** ${question}\n${sessNote}\n` +
+      `| Agent | CHOICE(s) | Confidence | Anti-echo |\n|---|---|---|---|\n${echoTable}\n` +
+      (echoWarns.length ? `\n${echoWarns.join('\n')}\n` : '') + '\n' +
+      results.map((r) => `## ${r.label}\n\n${r.text}\n`).join('\n');
     writeFileSync(join(dir, 'summary.md'), md, 'utf8');
     console.log(`\n${results.map((r) => `\x1b[1m${r.label}\x1b[0m\n${r.text}\n`).join('\n')}`);
     console.log(`✅ .squad/${id}/summary.md`);
@@ -531,10 +759,11 @@ function validateTasks(tasks) {
     return;
   }
 
-  console.error('usage: node squad.mjs <ideas|code|review|doctor> ...');
-  console.error('  ideas "question" [--only claude,codex,grok] [--files a.js,b.js|-] [--timeout secs]');
+  console.error('usage: node squad.mjs <ideas|code|review|session|doctor> ...');
+  console.error('  ideas "question" [--only claude,codex,grok] [--files a.js,b.js|-] [--session name] [--timeout secs]');
   console.error('  code tasks.json [--worktree] [--dry-run] [--timeout secs]');
   console.error('  review [ref] --goal "intent" [--verify "cmd1;;cmd2"] [--author claude] [--allow-truncate]');
+  console.error('  session <list|show name|reset name>   # manage persistent ideas sessions');
   console.error('  doctor    # check which agent CLIs are available');
   process.exit(1);
 })();

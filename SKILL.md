@@ -72,12 +72,23 @@ never become a permanent monopoly.
 ## Ideas mode
 
 ```
-node squad.mjs ideas "question" [--only codex,grok] [--files a.js,b.js]
+node squad.mjs ideas "question" [--only codex,grok] [--files a.js,b.js] [--session name]
 ```
 
 Same question to all agents in parallel; collect divergent answers; synthesize yourself.
 Preserve divergence — the value is in the different angles, not consensus.
 `--files` injects file content into the prompt of agents that can't read the repo; `-` = stdin.
+
+**Anti-echo (automatic):** every answer ends with a locked block `CHOICE / TRADEOFF
+ACCEPTED / TRADEOFF REJECTED / KILL / DISSENT / CONFIDENCE`; the runner builds a table in
+`summary.md` and flags "possible echo" (Jaccard ≥0.7 on tradeoffs). Advisory only — the
+adjudicator invalidates rounds, not the script.
+
+**Persistent sessions (opt-in):** `--session <name>` resumes Codex/Grok across calls
+(Claude stays fresh as the control voice); ids in `.squad-sessions/<name>.json`;
+hard-stop 8 uses/7 days; failed resume degrades to fresh with a warning. Manage with
+`session list|show|reset`. Blind re-runs must NEVER use sessions — their value is coming
+in clean. `review`/`code` reject the flag.
 
 ## Review mode (parallel code review of a real diff)
 

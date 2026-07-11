@@ -140,3 +140,32 @@ test('tasks.example.json is valid and works in code dry-run', () => {
 
   assert.equal(result.status, 0);
 });
+
+test('session reset with path traversal is rejected (never deletes outside squad-sessions)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'squad-sess-'));
+  tmpDirs.push(dir);
+  writeFileSync(join(dir, 'package.json'), '{"name":"victim"}\n', 'utf8');
+
+  const result = spawnSync('node', [join(root, 'squad.mjs'), 'session', 'reset', '../../package'], {
+    cwd: dir,
+    encoding: 'utf8',
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(output(result), /invalid session name/i);
+  assert.equal(readFileSync(join(dir, 'package.json'), 'utf8'), '{"name":"victim"}\n');
+});
+
+test('--session is rejected in review and code (flag presence, not value)', () => {
+  for (const args of [['review', '--session'], ['review', '--session', 'x', '--goal', 'g'], ['code', 'tasks.json', '--session', 'x']]) {
+    const result = runSquad(args);
+    assert.equal(result.status, 1, args.join(' '));
+    assert.match(output(result), /only exists in ideas mode/i);
+  }
+});
+
+test('ideas --session without a name errors instead of silently running fresh', () => {
+  const result = runSquad(['ideas', 'some question', '--session']);
+  assert.equal(result.status, 1);
+  assert.match(output(result), /requires a name/i);
+});
