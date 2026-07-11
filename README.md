@@ -112,6 +112,34 @@ node squad.mjs code tasks.json --dry-run   # show the plan, execute nothing
 
 Nothing merges itself. The squad parallelizes work — judgment stays with you.
 
+## Mode 3 — `review` (parallel code review of a real diff)
+
+```bash
+node squad.mjs review --goal "what the change should do"          # uncommitted changes
+node squad.mjs review HEAD --goal "..."                           # last commit
+node squad.mjs review a1b2..c3d4 --goal "..." --verify "npm test;;npm run build"
+node squad.mjs review --goal "..." --author claude                # exclude the author
+```
+
+Closes the loop **code → test → have the squad check the result**:
+
+- **`--goal` is required.** Without declared intent, review degenerates into style
+  opinions. Reviewers also report an *Out of scope* section: what the diff did beyond
+  the goal (scope creep) and what part of the goal it did **not** accomplish.
+- **`--verify "cmd1;;cmd2"`** runs deterministic commands (build/tests) *before* the
+  reviewers and injects exit codes + output tails into their context. A failed
+  verification forces a CHANGE verdict — review becomes an audit, not an opinion.
+- In working-tree mode, **new untracked files are included** (`git diff HEAD` can't see
+  them, and the regression may live exactly there). Dotfolders are skipped as tooling noise.
+- **Oversized diffs abort** with a per-file `--stat` map instead of silently truncating
+  (a cut mid-file hides exactly the regression). `--allow-truncate` only if you accept that.
+- **`--author <agent>` excludes the agent that wrote the code** — an author should not
+  review itself. `--only` overrides everything.
+- Fixed output format per reviewer — `## Verdict` (APPROVE|CHANGE), `## Findings`
+  (`[bug|risk|style] (confidence) file:snippet — problem + suggestion`), `## Out of
+  scope`, `## What I would do differently` — plus a verdict table in `summary.md`.
+- Findings are input, not authority: verify each claim against the code before acting.
+
 ## Output layout
 
 ```

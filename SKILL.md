@@ -1,6 +1,6 @@
 ---
 name: agent-squad
-description: PARALLEL execution of multiple coding-agent CLIs (Claude Code, Codex, Grok, or any headless agent CLI) for simultaneous coding and divergent idea generation. Use when a task can be split into independent pieces touched at the same time, or when you want several divergent takes at once. Fan-out, not chat — dispatch all agents together, each coder isolated in a git worktree (zero conflicts), review and integrate at the end. Includes a benchmark protocol to measure your agents and assign roles by evidence.
+description: PARALLEL execution of multiple coding-agent CLIs (Claude Code, Codex, Grok, or any headless agent CLI) for simultaneous coding, divergent idea generation, and parallel code review of real diffs. Use when a task can be split into independent pieces touched at the same time, when you want several divergent takes at once, or when you want a diff audited against its declared intent by reviewers that did not write it. Fan-out, not chat — dispatch all agents together, each coder isolated in a git worktree (zero conflicts), review and integrate at the end. Includes a benchmark protocol to measure your agents and assign roles by evidence.
 ---
 
 # Agent Squad — simultaneous coding + parallel ideas
@@ -17,6 +17,7 @@ zero deps) — or replace the runner with whatever dispatch mechanism your stack
 |---|---|---|
 | Task splittable into independent pieces (distinct files/modules) | ✅ | `code` |
 | Want 2-3 divergent takes/angles at once | ✅ | `ideas` |
+| A diff needs auditing against its declared intent, by non-authors | ✅ | `review` |
 | Task needs shared context / a single file | ❌ | do it solo or sequentially |
 | Small surgical change | ❌ | do it directly |
 | Large refactor touching everything | ❌ | serial, one agent |
@@ -77,6 +78,28 @@ node squad.mjs ideas "question" [--only codex,grok] [--files a.js,b.js]
 Same question to all agents in parallel; collect divergent answers; synthesize yourself.
 Preserve divergence — the value is in the different angles, not consensus.
 `--files` injects file content into the prompt of agents that can't read the repo; `-` = stdin.
+
+## Review mode (parallel code review of a real diff)
+
+```
+node squad.mjs review [ref] --goal "what the change should do" \
+  [--verify "npm test;;npm run build"] [--author claude] [--allow-truncate]
+```
+
+Closes the loop **code → test → have the squad check the result**. Rules that make it
+an audit instead of an opinion:
+
+- **`--goal` is required.** Reviewers check the diff did what was asked — and report
+  scope creep / unaccomplished intent in a dedicated *Out of scope* section.
+- **`--verify` runs deterministic commands first** and injects exit codes + tails into
+  the reviewers' context. Failed verification forces a CHANGE verdict.
+- **The author never reviews itself** — exclude it with `--author <agent>`.
+- New untracked files are included in working-tree reviews; oversized diffs abort with a
+  per-file map instead of silently truncating (a cut mid-file hides the regression).
+- Fixed format per reviewer: Verdict (APPROVE|CHANGE) · Findings
+  (`[bug|risk|style] (confidence) file:snippet`) · Out of scope · What I'd do differently.
+- **Findings are input, not authority**: verify every claim against the code before
+  acting on it. Reviewers hallucinate line numbers too.
 
 ## Adapting to your agents
 

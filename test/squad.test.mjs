@@ -40,7 +40,40 @@ test('usage without arguments exits 1 and lists subcommands', () => {
   assert.equal(result.status, 1);
   assert.match(text, /ideas/i);
   assert.match(text, /code/i);
+  assert.match(text, /review/i);
   assert.match(text, /doctor/i);
+});
+
+test('review without --goal exits 1 and explains why intent is required', () => {
+  const result = runSquad(['review']);
+  const text = output(result);
+
+  assert.equal(result.status, 1);
+  assert.match(text, /--goal/);
+  assert.match(text, /intent/i);
+});
+
+test('review with --goal but a clean tree exits 1 with empty-diff message', () => {
+  // Fresh throwaway git repo: never dispatches real agents, regardless of the state of
+  // the checkout running the tests.
+  const dir = mkdtempSync(join(tmpdir(), 'squad-review-'));
+  tmpDirs.push(dir);
+  const git = (args) => spawnSync('git', args, { cwd: dir, encoding: 'utf8' });
+  git(['init', '-q']);
+  git(['config', 'user.email', 'test@test']);
+  git(['config', 'user.name', 'test']);
+  writeFileSync(join(dir, 'a.txt'), 'hello\n', 'utf8');
+  git(['add', '.']);
+  git(['commit', '-qm', 'init']);
+
+  const result = spawnSync('node', [join(root, 'squad.mjs'), 'review', '--goal', 'test intent'], {
+    cwd: dir,
+    encoding: 'utf8',
+  });
+  const text = output(result);
+
+  assert.equal(result.status, 1);
+  assert.match(text, /empty diff|nothing to review/i);
 });
 
 test('doctor exits 0 and reports agent availability', () => {
